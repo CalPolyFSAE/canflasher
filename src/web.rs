@@ -4,12 +4,34 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
 use can_hal::CanId;
 use can_hal_kvaser::{Classic, KvaserChannel};
 
-use crate::Manager;
+use crate::{Manager, UploadError};
 
 const MAX_BINARY_SIZE: usize = 16 * 1024 * 1024;
 const SELF_CAN_ID: CanId = CanId::Standard(0x7FF);
 
 type FlashManager = Manager<KvaserChannel<Classic>>;
+
+#[derive(thiserror::Error, Debug)]
+enum FlashError {
+    #[error("flash manager lock is poisoned")]
+    ManagerUnavailable,
+    #[error("upload failed: {0}")]
+    Upload(UploadError),
+}
+
+impl From<FlashError> for HttpResponse {
+    fn from(error: FlashError) -> Self {
+        match error {
+            FlashError::Upload(UploadError::InvalidWindowSize | UploadError::BinaryTooLarge) => {
+                HttpResponse::BadRequest().body(error.to_string())
+            }
+            FlashError::ManagerUnavailable
+            | FlashError::Upload(UploadError::Transmit | UploadError::InvalidAcknowledgement) => {
+                HttpResponse::InternalServerError().body(error.to_string())
+            }
+        }
+    }
+}
 
 #[post("/flash/{can_id}/{window_size}")]
 async fn flash_binary(
@@ -23,18 +45,16 @@ async fn flash_binary(
     };
 
     let result = web::block(move || {
-        let mut manager = manager
-            .lock()
-            .map_err(|_| "flash manager lock is poisoned".to_owned())?;
+        let mut manager = manager.lock().map_err(|_| FlashError::ManagerUnavailable)?;
         manager
             .upload_binary(SELF_CAN_ID, can_id, &binary, window_size)
-            .map_err(|error| error.to_string())
+            .map_err(FlashError::Upload)
     })
     .await;
 
     match result {
         Ok(Ok(())) => HttpResponse::Ok().body("flash completed"),
-        Ok(Err(error)) => HttpResponse::BadRequest().body(error),
+        Ok(Err(error)) => error.into(),
         Err(error) => HttpResponse::InternalServerError().body(error.to_string()),
     }
 }
@@ -52,18 +72,16 @@ async fn flash_binary_default_window(
     };
 
     let result = web::block(move || {
-        let mut manager = manager
-            .lock()
-            .map_err(|_| "flash manager lock is poisoned".to_owned())?;
+        let mut manager = manager.lock().map_err(|_| FlashError::ManagerUnavailable)?;
         manager
             .upload_binary(SELF_CAN_ID, can_id, &binary, 8)
-            .map_err(|error| error.to_string())
+            .map_err(FlashError::Upload)
     })
     .await;
 
     match result {
         Ok(Ok(())) => HttpResponse::Ok().body("flash completed"),
-        Ok(Err(error)) => HttpResponse::BadRequest().body(error),
+        Ok(Err(error)) => error.into(),
         Err(error) => HttpResponse::InternalServerError().body(error.to_string()),
     }
 }

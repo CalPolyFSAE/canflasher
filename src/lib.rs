@@ -21,8 +21,8 @@ impl DataHeader {
 
 #[repr(C)]
 pub struct DataFrame {
-    seq_num: u16,
-    payload: [u8; 6],
+    seq_num: u32,
+    payload: [u8; 4],
 }
 
 impl DataFrame {
@@ -30,8 +30,8 @@ impl DataFrame {
     /// is sent separately in the transfer header.
     pub fn to_can_frame(&self, can_id: CanId) -> CanFrame {
         let mut data = [0; 8];
-        data[..2].copy_from_slice(&self.seq_num.to_le_bytes());
-        data[2..].copy_from_slice(&self.payload);
+        data[..4].copy_from_slice(&self.seq_num.to_le_bytes());
+        data[4..].copy_from_slice(&self.payload);
         CanFrame::new(can_id, &data).expect("logic has failed us")
     }
 }
@@ -40,7 +40,7 @@ impl DataFrame {
 pub enum UploadError {
     #[error("the sliding-window size must be greater than zero")]
     InvalidWindowSize,
-    #[error("binary is too large for 16-bit chunk sequence numbers")]
+    #[error("binary is too large for 32-bit chunk sequence numbers")]
     BinaryTooLarge,
     #[error("failed to transmit a CAN frame")]
     Transmit,
@@ -76,7 +76,11 @@ where
         self.channel.transmit(message)
     }
 
-    pub fn upload_data_frame(&mut self, data_frame: &DataFrame, can_id: CanId) -> Result<(), UploadError> {
+    pub fn upload_data_frame(
+        &mut self,
+        data_frame: &DataFrame,
+        can_id: CanId,
+    ) -> Result<(), UploadError> {
         let can_frame = data_frame.to_can_frame(can_id);
         self.transmit(&can_frame)
             .map_err(|_| UploadError::Transmit)?;
@@ -95,32 +99,32 @@ where
         }
 
         let message_size = u32::try_from(binary.len()).map_err(|_| UploadError::BinaryTooLarge)?;
-        let chunk_count = binary.len().div_ceil(6);
-        let chunk_count = u16::try_from(chunk_count).map_err(|_| UploadError::BinaryTooLarge)?;
+        let chunk_count = binary.len().div_ceil(4);
 
         let header_payload = DataHeader {
             can_id: target_can_id,
-            message_size
+            message_size,
         };
         self.transmit(&header_payload.to_can_frame(self_can_id))
             .map_err(|_| UploadError::Transmit)?;
 
         let mut first_unacked = 0usize;
-        while first_unacked < usize::from(chunk_count) {
-            let window_end = first_unacked
-                .saturating_add(window_size)
-                .min(usize::from(chunk_count));
+        while first_unacked < chunk_count {
+            let window_end = first_unacked.saturating_add(window_size).min(chunk_count);
 
             for sequence in first_unacked..window_end {
-                let start = sequence * 6;
-                let end = start.saturating_add(6).min(binary.len());
-                let mut payload = [0; 6];
+                let start = sequence * 4;
+                let end = start.saturating_add(4).min(binary.len());
+                let mut payload = [0; 4];
                 payload[..end - start].copy_from_slice(&binary[start..end]);
 
-                self.upload_data_frame(&DataFrame {
-                    seq_num: sequence as u16,
-                    payload,
-                }, self_can_id)?;
+                self.upload_data_frame(
+                    &DataFrame {
+                        seq_num: sequence as u32,
+                        payload,
+                    },
+                    self_can_id,
+                )?;
             }
 
             let next_expected = self.receive_acks_dummy(first_unacked, window_end)?;
@@ -146,7 +150,7 @@ where
 impl Manager<can_hal_kvaser::KvaserChannel<Classic>> {
     pub fn new_kvaser() -> Result<Self, Box<dyn std::error::Error>> {
         let driver = can_hal_kvaser::KvaserDriver::new()?;
-        let channel = driver.channel(0).classic(80_000_000)?.connect()?;
+        let channel = driver.channel(0).classic(1_000_000)?.connect()?;
         Ok(Manager::new(channel))
     }
 }
