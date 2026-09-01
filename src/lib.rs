@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use can_hal::{CanFrame, CanId, Timestamped};
 use can_hal_kvaser::Classic;
 
