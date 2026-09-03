@@ -1,13 +1,31 @@
 #![allow(non_snake_case)]
+use std::time::{Duration, Instant};
+
 use can_hal::{CanFrame, CanId, Timestamped};
 use can_hal_kvaser::Classic;
 
 pub mod web;
 
+const CHUNK_SIZE: usize = 6;
+const ACK_MAGIC: u16 = 0xA55A;
+const ACK_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[repr(C)]
 pub struct DataHeader {
     can_id: CanId,
     message_size: u32,
+}
+
+#[repr(C)]
+pub struct DataFrame {
+    seq_num: u16,
+    payload: [u8; CHUNK_SIZE],
+}
+
+#[repr(C)]
+pub struct AckFrame {
+    magic: u16,
+    next_seq_num: u16,
 }
 
 impl DataHeader {
@@ -19,20 +37,32 @@ impl DataHeader {
     }
 }
 
-#[repr(C)]
-pub struct DataFrame {
-    seq_num: u32,
-    payload: [u8; 4],
-}
-
 impl DataFrame {
     /// Encodes one binary chunk as a classic CAN frame. The total message size
     /// is sent separately in the transfer header.
     pub fn to_can_frame(&self, can_id: CanId) -> CanFrame {
         let mut data = [0; 8];
-        data[..4].copy_from_slice(&self.seq_num.to_le_bytes());
-        data[4..].copy_from_slice(&self.payload);
+        data[..(8 - CHUNK_SIZE)].copy_from_slice(&self.seq_num.to_le_bytes());
+        data[(8 - CHUNK_SIZE)..].copy_from_slice(&self.payload);
         CanFrame::new(can_id, &data).expect("logic has failed us")
+    }
+}
+
+impl AckFrame {
+    pub fn new_from_frame(frame: CanFrame) -> Result<Self, &'static str> {
+        let data = frame.data();
+        if data.len() != 4 {
+            return Err("ack frame must be 4 bytes");
+        }
+        let magic = u16::from_le_bytes(data[..2].try_into().unwrap());
+        if magic != ACK_MAGIC {
+            return Err("ack frame has invalid magic number");
+        }
+        let next_seq_num = u16::from_le_bytes(data[2..].try_into().unwrap());
+        Ok(AckFrame {
+            magic,
+            next_seq_num,
+        })
     }
 }
 
@@ -40,10 +70,14 @@ impl DataFrame {
 pub enum UploadError {
     #[error("the sliding-window size must be greater than zero")]
     InvalidWindowSize,
-    #[error("binary is too large for 32-bit chunk sequence numbers")]
+    #[error("binary is too large for 16-bit chunk sequence numbers")]
     BinaryTooLarge,
     #[error("failed to transmit a CAN frame")]
     Transmit,
+    #[error("failed to receive a CAN frame")]
+    Receive,
+    #[error("timed out waiting for an acknowledgement")]
+    AcknowledgementTimeout,
     #[error("received an acknowledgement outside the current window")]
     InvalidAcknowledgement,
 }
@@ -98,8 +132,12 @@ where
             return Err(UploadError::InvalidWindowSize);
         }
 
+        if !(binary.len().div_ceil(CHUNK_SIZE) <= u16::MAX as usize) {
+            return Err(UploadError::BinaryTooLarge);
+        }
+
         let message_size = u32::try_from(binary.len()).map_err(|_| UploadError::BinaryTooLarge)?;
-        let chunk_count = binary.len().div_ceil(4);
+        let chunk_count = binary.len().div_ceil(CHUNK_SIZE);
 
         let header_payload = DataHeader {
             can_id: target_can_id,
@@ -113,21 +151,21 @@ where
             let window_end = first_unacked.saturating_add(window_size).min(chunk_count);
 
             for sequence in first_unacked..window_end {
-                let start = sequence * 4;
-                let end = start.saturating_add(4).min(binary.len());
-                let mut payload = [0; 4];
+                let start = sequence * CHUNK_SIZE;
+                let end = start.saturating_add(CHUNK_SIZE).min(binary.len());
+                let mut payload = [0; CHUNK_SIZE];
                 payload[..end - start].copy_from_slice(&binary[start..end]);
 
                 self.upload_data_frame(
                     &DataFrame {
-                        seq_num: sequence as u32,
+                        seq_num: sequence as u16,
                         payload,
                     },
                     self_can_id,
                 )?;
             }
 
-            let next_expected = self.receive_acks_dummy(first_unacked, window_end)?;
+            let next_expected = self.receive_ack(target_can_id, first_unacked, window_end)?;
             if next_expected <= first_unacked || next_expected > window_end {
                 return Err(UploadError::InvalidAcknowledgement);
             }
@@ -137,13 +175,36 @@ where
         Ok(())
     }
 
-    // todo: implement real acks - parse cumulative ack and return next seq num
-    fn receive_acks_dummy(
+    fn receive_ack(
         &mut self,
-        _first_unacked: usize,
+        target_can_id: CanId,
+        first_unacked: usize,
         window_end: usize,
     ) -> Result<usize, UploadError> {
-        Ok(window_end)
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        let response = loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(UploadError::AcknowledgementTimeout)?;
+            let response = self
+                .channel
+                .receive_timeout(remaining)
+                .map_err(|_| UploadError::Receive)?
+                .ok_or(UploadError::AcknowledgementTimeout)?
+                .into_frame();
+
+            if response.id() == target_can_id {
+                break response;
+            }
+        };
+
+        let ack: AckFrame =
+            AckFrame::new_from_frame(response).map_err(|_| UploadError::InvalidAcknowledgement)?;
+        if ack.next_seq_num < first_unacked as u16 || ack.next_seq_num > window_end as u16 {
+            return Err(UploadError::InvalidAcknowledgement);
+        }
+
+        Ok(ack.next_seq_num as usize)
     }
 }
 

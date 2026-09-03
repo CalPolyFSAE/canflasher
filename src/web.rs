@@ -6,7 +6,7 @@ use can_hal_kvaser::{Classic, KvaserChannel};
 
 use crate::{Manager, UploadError};
 
-const MAX_BINARY_SIZE: usize = 16 * 1024 * 1024;
+const MAX_BINARY_SIZE: usize = u16::MAX as usize * 6;
 const SELF_CAN_ID: CanId = CanId::Standard(0x7FF);
 
 type FlashManager = Manager<KvaserChannel<Classic>>;
@@ -25,10 +25,13 @@ impl From<FlashError> for HttpResponse {
             FlashError::Upload(UploadError::InvalidWindowSize | UploadError::BinaryTooLarge) => {
                 HttpResponse::BadRequest().body(error.to_string())
             }
-            FlashError::ManagerUnavailable
-            | FlashError::Upload(UploadError::Transmit | UploadError::InvalidAcknowledgement) => {
-                HttpResponse::InternalServerError().body(error.to_string())
+            FlashError::Upload(UploadError::AcknowledgementTimeout) => {
+                HttpResponse::GatewayTimeout().body(error.to_string())
             }
+            FlashError::ManagerUnavailable
+            | FlashError::Upload(
+                UploadError::Transmit | UploadError::Receive | UploadError::InvalidAcknowledgement,
+            ) => HttpResponse::InternalServerError().body(error.to_string()),
         }
     }
 }
