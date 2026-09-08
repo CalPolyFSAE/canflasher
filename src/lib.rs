@@ -215,3 +215,6 @@ impl Manager<can_hal_kvaser::KvaserChannel<Classic>> {
         Ok(Manager::new(channel))
     }
 }
+
+#[cfg(test)]
+mod tests;
